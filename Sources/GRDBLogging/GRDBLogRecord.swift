@@ -23,7 +23,10 @@ public struct GRDBLogRecord: Codable, LogRecord, FetchableRecord, PersistableRec
     /// The auto-incremented primary key assigned by SQLite on insertion, or `nil` until the record has been stored.
     ///
     /// An explicit `INTEGER PRIMARY KEY AUTOINCREMENT` (instead of an implicit rowid) guarantees that rows fetched
-    /// ordered by ``id`` come back in insertion order even when several records share the same ``timestamp``.
+    /// ordered by ``id`` come back in insertion order even when several records share the same ``timestamp`` — within
+    /// one inserted batch. Across batches, ids can invert relative to emission order because upstream
+    /// `BatchLogRecordProcessor.forceFlush()` splits large drains into concurrently exported chunks; chronology that
+    /// spans batches should therefore sort with `timestamp DESC, id DESC`.
     public var id: Int64?
 
     /// The moment the log record was created.

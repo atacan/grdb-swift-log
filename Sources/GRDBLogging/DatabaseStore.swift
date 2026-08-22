@@ -1,10 +1,5 @@
-import GRDB
-
-#if canImport(Glibc)
-import Glibc
-#else
 import Darwin
-#endif
+import GRDB
 
 /// An actor that owns the SQLite writer and appends whole batches of log records inside a single write transaction.
 ///
@@ -40,12 +35,6 @@ actor DatabaseStore {
     /// Whether the one-time drop notice has already been emitted.
     private var hasEmittedDropNotice = false
 
-    /// The default table name used when a configuration does not select one.
-    static let defaultTableName = GRDBLoggingConfiguration.defaultTableName
-
-    /// The identifier of the single schema migration.
-    private static let migrationIdentifier = "v1"
-
     // MARK: - Initialization
 
     /// Creates a store persisting records into the given destination and table.
@@ -73,8 +62,14 @@ actor DatabaseStore {
     /// from an already-cancelled task. Blocking the actor for the duration of one small transaction is the same
     /// trade-off the POSIX `write(2)` in comparable backends makes.
     ///
+    /// Ordering is guaranteed *within* this append only: each record becomes exactly one row whose auto-incremented
+    /// primary key preserves its position in `records`. Across appends, keys can invert relative to emission order,
+    /// because upstream `BatchLogRecordProcessor.forceFlush()` splits large buffers (more than
+    /// `maximumExportBatchSize`, 512 by default) into concurrently exported chunks. Reads that need chronological
+    /// order across batches should therefore sort with `ORDER BY timestamp, id` instead of `id` alone.
+    ///
     /// - Parameter records: The records to persist, in insertion order; each becomes exactly one row whose
-    ///   auto-incremented primary key preserves that order.
+    ///   auto-incremented primary key preserves that order within the batch.
     func append(_ records: [GRDBLogRecord]) {
         guard !closed, !records.isEmpty else { return }
 
@@ -100,8 +95,10 @@ actor DatabaseStore {
 
     /// Marks the store closed; further appends are silently ignored.
     ///
-    /// GRDB has no explicit close API: dropping the last reference to the pool or queue releases its connections and
-    /// file handles. This method therefore only stops future appends.
+    /// The store relies on deinitialization instead of calling GRDB's `DatabaseReader.close()`: that API can throw —
+    /// notably with `SQLITE_BUSY`, when connections are still in use — and a failed close leaves zombie connections
+    /// behind. Dropping the last reference to the pool or queue releases its connections and file handles. This
+    /// method therefore only stops future appends.
     func close() {
         guard !closed else { return }
         closed = true
@@ -145,7 +142,9 @@ actor DatabaseStore {
     /// Returns the writer, creating it and applying the schema migration on first use.
     ///
     /// `.file` destinations open a `DatabasePool`, which GRDB runs in write-ahead logging (WAL) mode so concurrent
-    /// readers never block the writer. The parent directory of the path must already exist; it is not created, since
+    /// readers never block the writer. Its writer waits up to five seconds for a competing lock instead of failing
+    /// immediately, so a second process logging to the same file queues its batch rather than dropping it with an
+    /// instant `SQLITE_BUSY`. The parent directory of the path must already exist; it is not created, since
     /// a logging backend must not invent directory structures next to whatever it was pointed at. `.inMemory`
     /// destinations open a private `DatabaseQueue`.
     ///
@@ -158,7 +157,9 @@ actor DatabaseStore {
         let newWriter: any DatabaseWriter
         switch destination {
         case .file(let path):
-            newWriter = try DatabasePool(path: path)
+            var configuration = Configuration()
+            configuration.busyMode = .timeout(5)
+            newWriter = try DatabasePool(path: path, configuration: configuration)
         case .inMemory:
             newWriter = try DatabaseQueue()
         }
@@ -169,11 +170,15 @@ actor DatabaseStore {
 
     /// Builds the migrator ensuring the schema for the given table exists.
     ///
+    /// The migration identifier embeds the table name (`"v1-<table>"`): GRDB tracks applied migrations per database
+    /// *file*, so two stores sharing one file under different table names must not compete for a single `"v1"` entry —
+    /// otherwise the second store's `CREATE TABLE` would never run and its batches would fail with "no such table".
+    ///
     /// - Parameter tableName: The table name interpolated into the migration's DDL; validated upstream.
-    /// - Returns: A migrator registering the `"v1"` schema creation.
+    /// - Returns: A migrator registering the `"v1-\(tableName)"` schema creation.
     private static func migrator(tableName: String) -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        migrator.registerMigration(migrationIdentifier) { db in
+        migrator.registerMigration("v1-\(tableName)") { db in
             try db.create(table: tableName) { definition in
                 // INTEGER PRIMARY KEY AUTOINCREMENT keeps rows ordered by insertion time even when timestamps tie.
                 definition.autoIncrementedPrimaryKey("id")
@@ -226,8 +231,8 @@ actor DatabaseStore {
 
     /// Records a dropped batch and emits a one-time notice to standard error.
     ///
-    /// The notice goes straight to descriptor 2 rather than through C's `stderr`: on Linux/Glibc that global is
-    /// imported as shared mutable state, which strict concurrency forbids referencing from actor-isolated code.
+    /// The notice goes straight to descriptor 2 rather than through C's `stderr`: that global is non-Sendable under
+    /// Swift 6 strict concurrency, which would forbid referencing it from actor-isolated code.
     ///
     /// - Parameter reason: A short human-readable explanation for the drop.
     private func noteDroppedBatch(reason: String) {

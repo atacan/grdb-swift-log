@@ -9,7 +9,7 @@ A [swift-log](https://github.com/apple/swift-log) backend that persists your app
 
 - **Queryable logs**: every record becomes exactly one row (`id`, `timestamp`, `level`, `label`, `message`, `metadata`, `source`, `file`, `function`, `line`) in a table you can `SELECT`, join, aggregate and prune with plain SQL — long after the log call happened.
 - **SQLite persistence with concurrent readers**: `.file` destinations open a `DatabasePool` in write-ahead logging (WAL) mode, so readers never block the writer and vice versa — tail or inspect your logs while the app keeps logging.
-- **Batched transactions**: each export batch is inserted inside one write transaction — a single durability point per batch instead of per record. An `INTEGER PRIMARY KEY AUTOINCREMENT` preserves insertion order even when records share a timestamp.
+- **Batched transactions**: each export batch is inserted inside one write transaction — a single durability point per batch instead of per record. An `INTEGER PRIMARY KEY AUTOINCREMENT` preserves insertion order *within* one batch, even when records share a timestamp — batches larger than `maximumExportBatchSize` are drained as concurrent chunks, so ids can invert across chunk boundaries. For chronological reads, sort with `ORDER BY timestamp DESC, id DESC` (see [Querying your logs](#querying-your-logs)).
 - **Built on the SwiftLogExport pipeline**: records flow through a batching `BatchLogRecordProcessor` into a `GRDBLogRecordExporter`, so you get queueing, scheduled exports and graceful drain for free.
 - **Stable, machine-readable fields**: ISO-8601 UTC timestamps *with* fractional seconds (fixed-width strings that sort chronologically as plain text), lowercase levels, metadata as a JSON object stored in a nullable column (`NULL` when empty).
 - **ServiceLifecycle-friendly**: `bootstrap(_:)` hands you the processor back; run it in a `ServiceGroup` and shutdown drains the buffer and closes the store.
@@ -129,14 +129,14 @@ for record in recentErrors {
 }
 ```
 
-`ORDER BY timestamp DESC, id DESC` matters: timestamps have millisecond precision, so the auto-incremented `id` breaks ties back into true insertion order. Aggregation works just as well:
+`ORDER BY timestamp DESC, id DESC` matters: timestamps have millisecond precision, so the auto-incremented `id` breaks ties back into emission order (within a single export batch; very large drains are chunked, so across batches this ordering is approximate). Aggregation works just as well:
 
 ```sql
 SELECT strftime('%Y-%m-%d', timestamp) AS day, count(*) AS errors
 FROM logs WHERE level = 'error' GROUP BY day ORDER BY day;
 ```
 
-`GRDBLogRecord.databaseTableName` follows the default `"logs"` table. If you configured another `tableName`, address it with an explicit `SQLRequest<GRDBLogRecord>` instead of the static record API.
+`GRDBLogRecord.databaseTableName` follows the default `"logs"` table. If you configured another `tableName`, address it with an explicit `SQLRequest<GRDBLogRecord>` instead of the static record API — and do **not** write through `GRDBLogRecord`'s own persistence methods (`insert`, `update`, `delete` from `PersistableRecord`): those always resolve against the statically declared `"logs"` table regardless of your configuration, so rows must go through the exporter/store path instead, which interpolates the configured name into its statements.
 
 ### Sample row
 
@@ -161,7 +161,32 @@ the `logs` table gains:
 | `function` | `'submitOrder()'` |
 | `line` | `42` |
 
-Rows without metadata store `NULL` in `metadata`, which decodes back to an empty dictionary. The schema is created lazily by a `v1` migration the first time anything is written — an exporter that never receives a record never touches disk.
+Rows without metadata store `NULL` in `metadata`, which decodes back to an empty dictionary. The schema is created lazily by an initial schema migration registered per table name the first time anything is written — an exporter that never receives a record never touches disk.
+
+### Mixing with other backends
+
+Prefer human-readable logs on the console while also persisting every record as a row in SQLite? Build the pipeline yourself and hand both handlers to a `MultiplexLogHandler`. This bypasses `GRDBLogging.bootstrap` entirely, which is why no global bootstrap trap applies here — just make sure something drives the processor.
+
+```swift
+import Logging
+import SwiftLogExport
+import GRDBLogging
+
+let exporter = GRDBLogRecordExporter(destination: .file(path: "logs/app.sqlite"))
+let processor = BatchLogRecordProcessor<GRDBLogRecord, GRDBLogRecordExporter, ContinuousClock>(
+    exporter: exporter,
+    configuration: BatchLogRecordProcessorConfiguration(scheduleDelay: .seconds(5))
+)
+
+LoggingSystem.bootstrap { label in
+    let consoleHandler = StreamLogHandler.standardOutput(label: label)
+    let databaseHandler = LoggingHandler(label: label, processor: processor)
+    return MultiplexLogHandler([consoleHandler, databaseHandler])
+}
+
+// Don't forget the driver here either.
+Task { try await processor.run() }
+```
 
 ## Advanced Configuration
 
@@ -172,7 +197,7 @@ Every knob lives on `GRDBLoggingConfiguration`:
 | `destination` | *(none — required)* | `.file(path:)` opens (or creates) the SQLite database at the given path as a WAL-mode `DatabasePool`; the parent directory must already exist and is **not** created. `.inMemory` opens a private in-memory database — ideal for tests and previews, but its contents vanish with the process. There is deliberately no default: an implicit one would either surprise you with files or silently discard your logs. |
 | `level` | `.info` | Minimum level handled by every logger created during bootstrap. Per-logger levels can still be changed afterwards via `Logger.logLevel`. |
 | `baseMetadata` | `[:]` | Merged into every record unless a logging call overrides a key. Nested values are flattened lossily to strings (see [Limitations](#limitations)). |
-| `tableName` | `"logs"` | SQL table created by the `v1` migration and written to. Validated against `^[A-Za-z_][A-Za-z0-9_]*$` at initialization; invalid names throw, since the name ends up interpolated into DDL/DML statements (SQLite cannot bind identifiers). |
+| `tableName` | `"logs"` | SQL table created by the initial schema migration and written to. Validated against `^[A-Za-z_][A-Za-z0-9_]*$` at initialization; invalid names throw, since the name ends up interpolated into DDL/DML statements (SQLite cannot bind identifiers). |
 | `processorConfiguration.scheduleDelay` | `.seconds(1)` | Maximum delay between two exports — effectively your **flush latency** for quiet periods. Lower it if other processes read the database live. |
 | `processorConfiguration.maximumExportBatchSize` | `512` | Maximum number of records handed to the exporter in one export call (one transaction); larger queues are drained in chunks of this size. It does **not** trigger earlier exports — timing is governed by `scheduleDelay` and the `maximumQueueSize` threshold. |
 | `processorConfiguration.maximumQueueSize` | `2048` | Number of records buffered between exports; when the buffer count reaches this size an export is triggered immediately instead of waiting for `scheduleDelay`. It is not a hard cap — records are never dropped, so a sustained burst can grow the buffer further. |
@@ -196,7 +221,7 @@ let configuration = try GRDBLoggingConfiguration(
 GRDBLogging.bootstrap(configuration)
 ```
 
-You can also flush eagerly without waiting for the schedule: `try await processor.forceFlush()` drains every buffered record through the exporter. Because each batch already commits its own transaction, records are durable the moment the call returns.
+You can also flush eagerly without waiting for the schedule: `try await processor.forceFlush()` drains every buffered record through the exporter. Because each batch already commits its own transaction, records are committed and durable against process crashes the moment the call returns — WAL mode does not fsync every commit (`DatabasePool` runs with `PRAGMA synchronous = NORMAL`), so an operating-system crash or power loss may still lose the most recent commits until SQLite writes a checkpoint.
 
 ## Limitations
 

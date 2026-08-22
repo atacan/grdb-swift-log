@@ -47,7 +47,10 @@ public struct GRDBLogRecordExporter: LogRecordExporter, Sendable {
 
     // MARK: - LogRecordExporter
 
-    /// Persists the given batch as rows of the configured table, in order.
+    /// Persists the given batch as rows of the configured table, preserving the record order *within the batch*.
+    ///
+    /// Across batches, primary keys can invert relative to emission order — upstream drains split large buffers into
+    /// concurrently exported chunks — so chronological reads should sort by `timestamp, id`.
     ///
     /// - Parameter batch: The records to persist; each becomes exactly one row whose auto-incremented primary key
     ///   preserves the batch order.
@@ -58,9 +61,11 @@ public struct GRDBLogRecordExporter: LogRecordExporter, Sendable {
         await store.append(Array(batch))
     }
 
-    /// Ensures previously exported batches are committed durably.
+    /// Ensures previously exported batches are committed and durable against process crashes.
     ///
-    /// A no-op in practice: every batch already commits its own transaction on append.
+    /// A no-op in practice: every batch already commits its own transaction on append. Note that `.file` destinations
+    /// are WAL-mode pools running with `PRAGMA synchronous = NORMAL`, so commits survive process crashes; only a full
+    /// OS crash or power loss before the next checkpoint can lose them.
     public func forceFlush() async throws {
         await store.sync()
     }
