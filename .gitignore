@@ -1,0 +1,8 @@
+.DS_Store
+/.build
+/.swiftpm
+/netrc
+Package.resolved
+/.claude/settings.local.json
+*.xcodeproj
+xcuserdata/
