@@ -12,8 +12,9 @@ A [swift-log](https://github.com/apple/swift-log) backend that persists your app
 - **Batched transactions**: each export batch is inserted inside one write transaction — a single durability point per batch instead of per record. An `INTEGER PRIMARY KEY AUTOINCREMENT` preserves insertion order *within* one batch, even when records share a timestamp — batches larger than `maximumExportBatchSize` are drained as concurrent chunks, so ids can invert across chunk boundaries. For chronological reads, sort with `ORDER BY timestamp DESC, id DESC` (see [Querying your logs](#querying-your-logs)).
 - **Built on the SwiftLogExport pipeline**: records flow through a batching `BatchLogRecordProcessor` into a `GRDBLogRecordExporter`, so you get queueing, scheduled exports and graceful drain for free.
 - **Stable, machine-readable fields**: ISO-8601 UTC timestamps *with* fractional seconds (fixed-width strings that sort chronologically as plain text), lowercase levels, metadata as a JSON object stored in a nullable column (`NULL` when empty).
-- **ServiceLifecycle-friendly**: `bootstrap(_:)` hands you the processor back; run it in a `ServiceGroup` and shutdown drains the buffer and closes the store.
-- **Testing-friendly**: nothing forces a global bootstrap — construct exporters, processors and handlers directly in tests; SwiftLogExport's `@_spi(Testing)` buffer accessors let tests poll exactly what is queued before it lands in the database.
+- **Apple lifecycle-friendly**: `start(_:)` synchronously installs the backend and starts the async batching processor; its runtime handle provides explicit flush and terminal shutdown barriers.
+- **ServiceLifecycle-friendly**: `bootstrap(_:)` remains available for applications that want to own the processor in a `ServiceGroup`.
+- **Testing-friendly**: nothing forces a global bootstrap — construct exporters, processors, handlers, or a runtime around an existing processor in tests, while keeping once-per-process global state isolated.
 - **Strict-concurrency clean**: the sink is an actor (no locks), every public type is `Sendable`.
 
 ## Requirements
@@ -21,7 +22,7 @@ A [swift-log](https://github.com/apple/swift-log) backend that persists your app
 - Swift 6.1+
 - macOS 13+, iOS 16+, watchOS 9+, tvOS 16+, or visionOS 1+
 - **Apple platforms only, by design.** Linux is *deliberately* unsupported: this package targets Apple's platforms exclusively (and only macOS is covered by CI, see [.github/workflows/test.yml](.github/workflows/test.yml)). Windows is not supported either.
-- [apple/swift-log](https://github.com/apple/swift-log) 1.5+ and [SwiftLogExport](https://github.com/atacan/SwiftLogExport) 1.1+ ([groue/GRDB.swift](https://github.com/groue/GRDB.swift) 7.0+) are declared as dependencies; add GRDB yourself too if you want to query the database.
+- [apple/swift-log](https://github.com/apple/swift-log) 1.5+ and [SwiftLogExport](https://github.com/atacan/SwiftLogExport) revision `b8f0b7747fa1a50444bc86e3950cf411645ff2ce` ([groue/GRDB.swift](https://github.com/groue/GRDB.swift) 7.0+) are declared as dependencies; add GRDB yourself too if you want to query the database.
 
 ## Installation
 
@@ -32,7 +33,10 @@ Add the following to your `Package.swift` file:
 ```swift
 dependencies: [
     .package(url: "https://github.com/apple/swift-log", from: "1.5.0"),
-    .package(url: "https://github.com/atacan/SwiftLogExport.git", from: "1.1.0"),
+    .package(
+        url: "https://github.com/atacan/SwiftLogExport.git",
+        revision: "b8f0b7747fa1a50444bc86e3950cf411645ff2ce"
+    ),
     .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
     .package(url: "https://github.com/atacan/grdb-swift-log.git", from: "1.0.0"),
 ]
@@ -52,9 +56,126 @@ targets: [
 
 ## Usage
 
-Call `GRDBLogging.bootstrap(_:)` once at the very top of your entry point — **before** the first `Logger` is created. It installs the backend into `LoggingSystem.bootstrap` and returns the `BatchLogRecordProcessor` driving it. **You must drive that processor**, otherwise buffered records are never flushed to the database. Calling `bootstrap` more than once traps (swift-log semantics). The configuration initializer is throwing because it validates the table name, hence the `try`.
+Call either `GRDBLogging.start(_:)` or `GRDBLogging.bootstrap(_:)` once at the very top of your entry point, **before** the first `Logger` is created. Calling either entry point more than once traps (swift-log semantics). `start(_:)` is nonthrowing; the `try` in examples applies to configuration construction, which validates the table name.
 
-### Driven by ServiceGroup (recommended)
+### Apple app lifecycle — `start(_:)`
+
+Apple lifecycle callbacks do not need to be async. `GRDBLogging.start(_:)` synchronously installs the swift-log backend and starts the async batching processor for you. Only explicit lifecycle operations such as `forceFlush()` and `shutdown()` are async, so synchronous callbacks can bridge to them with `Task { ... }`.
+
+Flush when an app may resume; shut down only for a genuinely terminal lifecycle. `forceFlush()` persists everything emitted before the call and leaves logging operational. `shutdown()` is terminal: it closes ingress, drains accepted records, and waits for the exporter to close. Records emitted afterward are not expected to persist. Never block the main thread with a semaphore while waiting for either operation; launch a task or use the platform's background-execution or deferred-termination mechanism.
+
+#### SwiftUI
+
+This uses the one-argument `onChange` overload supported by iOS 16 and macOS 13:
+
+```swift
+import SwiftUI
+import GRDBLogging
+
+@main
+struct ExampleApp: App {
+    @Environment(\.scenePhase) private var scenePhase
+    private let logging: GRDBLoggingRuntime
+
+    init() {
+        let configuration = try! GRDBLoggingConfiguration(
+            destination: .file(path: logDatabasePath) // its parent directory must already exist
+        )
+        logging = GRDBLogging.start(configuration)
+    }
+
+    var body: some Scene {
+        WindowGroup { ContentView() }
+            .onChange(of: scenePhase) { phase in
+                guard phase == .background else { return }
+                Task { await logging.forceFlush() }
+            }
+    }
+}
+```
+
+Backgrounding flushes instead of shutting down because the same process may resume. On macOS, an application that needs a graceful termination handshake can use `@NSApplicationDelegateAdaptor` with the AppKit pattern below.
+
+#### UIKit
+
+```swift
+import UIKit
+import GRDBLogging
+
+@MainActor
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    private var logging: GRDBLoggingRuntime!
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        do {
+            let configuration = try GRDBLoggingConfiguration(
+                destination: .file(path: logDatabasePath) // its parent directory must already exist
+            )
+            logging = GRDBLogging.start(configuration)
+            return true
+        } catch {
+            print("Failed to configure logging: \(error)")
+            return false
+        }
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        Task { await logging.forceFlush() }
+    }
+}
+```
+
+If the flush needs extra time before suspension, use a UIKit background task:
+
+```swift
+func applicationDidEnterBackground(_ application: UIApplication) {
+    let taskID = application.beginBackgroundTask(withName: "Flush logs")
+    Task {
+        await logging.forceFlush()
+        application.endBackgroundTask(taskID)
+    }
+}
+```
+
+Do not rely on `applicationWillTerminate(_:)` as the primary iOS persistence mechanism.
+
+#### AppKit
+
+```swift
+import AppKit
+import GRDBLogging
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var logging: GRDBLoggingRuntime!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        do {
+            let configuration = try GRDBLoggingConfiguration(
+                destination: .file(path: logDatabasePath) // its parent directory must already exist
+            )
+            logging = GRDBLogging.start(configuration)
+        } catch {
+            fatalError("Failed to configure logging: \(error)")
+        }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await logging.shutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+```
+
+AppKit can use terminal `shutdown()` here because `.terminateLater` supplies an explicit deferred-termination handshake.
+
+### ServiceLifecycle — `bootstrap(_:)`
 
 Running the processor inside a `ServiceGroup` means graceful shutdown drains every buffered record through the exporter and closes the store. `ServiceLifecycle` comes in transitively once any of your dependencies provides it.
 
@@ -81,7 +202,7 @@ let serviceGroup = ServiceGroup(services: [processor])
 try await serviceGroup.run()
 ```
 
-### Driven by a Task
+### Manual task driving — `bootstrap(_:)`
 
 If you do not use `ServiceLifecycle`, run the processor on a task and cancel that task when your application shuts down — `run()` reacts to cancellation by exporting everything still queued and shutting the exporter down.
 
@@ -100,7 +221,7 @@ let processorTask = Task { try await processor.run() }
 let logger = Logger(label: "app")
 logger.error("Payment provider unreachable")
 
-// On shutdown: canceling triggers the final drain and closes the store.
+// On terminal shutdown: cancellation closes ingress, drains accepted records, and closes the store.
 processorTask.cancel()
 try? await processorTask.value
 ```
@@ -221,7 +342,7 @@ let configuration = try GRDBLoggingConfiguration(
 GRDBLogging.bootstrap(configuration)
 ```
 
-You can also flush eagerly without waiting for the schedule: `try await processor.forceFlush()` drains every buffered record through the exporter. Because each batch already commits its own transaction, records are committed and durable against process crashes the moment the call returns — WAL mode does not fsync every commit (`DatabasePool` runs with `PRAGMA synchronous = NORMAL`), so an operating-system crash or power loss may still lose the most recent commits until SQLite writes a checkpoint.
+You can also flush eagerly without waiting for the schedule: `try await processor.forceFlush()` is an ingress barrier that drains every record accepted before the call through the exporter. Because each batch already commits its own transaction, records are committed and durable against process crashes the moment the call returns — WAL mode does not fsync every commit (`DatabasePool` runs with `PRAGMA synchronous = NORMAL`), so an operating-system crash or power loss may still lose the most recent commits until SQLite writes a checkpoint.
 
 ## Limitations
 

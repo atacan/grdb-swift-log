@@ -24,7 +24,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
         // SwiftLogExport provides the `LogRecord`/`LogRecordExporter`/`BatchLogRecordProcessor` pipeline
         // plus the @_spi(Testing) buffer accessors used by the drain tests.
-        .package(url: "https://github.com/atacan/SwiftLogExport.git", from: "1.1.0"),
+        .package(
+            url: "https://github.com/atacan/SwiftLogExport.git",
+            revision: "b8f0b7747fa1a50444bc86e3950cf411645ff2ce"
+        ),
         // GRDB provides the SQLite persistence layer every log record is inserted into.
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
     ],
