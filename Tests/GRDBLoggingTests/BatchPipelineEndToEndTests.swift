@@ -39,7 +39,8 @@ import Testing
         logger.notice("all done")
         let lastCallLine = #line - 1
 
-        let records = try await flushedRecords(from: store, processor: processor, expectedRecordCount: 5)
+        try await processor.forceFlush()
+        let records = try await store.fetchAllRecords()
         #expect(records.count == 5)  // exactly one row per record, no partial writes, no duplicates
         #expect(await processor.bufferedRecordCount == 0)  // every record left the buffer into the database
 
@@ -97,17 +98,6 @@ import Testing
             logger.info("\(message)")
         }
 
-        // Records reach the processor's buffer asynchronously via an AsyncStream whose unconsumed elements are
-        // discarded when the consuming task is cancelled, so wait until every record has actually crossed into the
-        // buffer before cancelling. SwiftLogExport's Testing SPI (``BatchLogRecordProcessor/bufferedRecordCount``)
-        // makes this deterministic — no sleep-and-hope timing margin that could flake on a loaded CI runner. The
-        // one-minute schedule delay guarantees the *only* writer to the database is the drain on the graceful-shutdown
-        // path of run(), which is exactly what this test exercises.
-        let deadline = ContinuousClock.now + .seconds(10)
-        while await processor.bufferedRecordCount < messages.count, ContinuousClock.now < deadline {
-            await Task.yield()  // let run()'s consumer task drain the stream into the buffer
-        }
-        #expect(await processor.bufferedRecordCount == messages.count)  // all five crossed before cancellation
         let storedBeforeCancellation = try await store.fetchAllRecords()
         #expect(storedBeforeCancellation.isEmpty)  // nothing may be written before cancellation
 

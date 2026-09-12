@@ -88,41 +88,6 @@ func decodedRecord(from json: String) throws -> GRDBLogRecord {
     return try decoder.decode(GRDBLogRecord.self, from: Data(json.utf8))
 }
 
-// MARK: - Waiting for asynchronous pipelines
-
-/// Flushes the processor repeatedly until storage holds at least the expected number of rows.
-///
-/// Records travel from `onEmit` through an `AsyncStream` into the processor's buffer asynchronously, so a single
-/// `forceFlush()` right after logging can legitimately observe an empty buffer. Polling keeps the test independent of
-/// scheduling latency while bounding the wait.
-///
-/// - Parameters:
-///   - store: The store backing the processor's exporter; read back after every flush attempt.
-///   - processor: The processor draining into the store.
-///   - expectedRecordCount: The number of rows to wait for.
-///   - timeout: How long to keep polling before giving up and returning what is there. Defaults to 10 seconds.
-/// - Returns: The stored records ordered by their primary key; possibly fewer than `expectedRecordCount` when the
-///   timeout elapsed first.
-/// - Throws: When flushing or reading fails.
-func flushedRecords(
-    from store: DatabaseStore,
-    processor: GRDBLogRecordProcessor,
-    expectedRecordCount: Int,
-    timeout: Duration = .seconds(10)
-) async throws -> [GRDBLogRecord] {
-    let deadline = ContinuousClock.now + timeout
-    var records: [GRDBLogRecord] = []
-    while ContinuousClock.now < deadline {
-        try await processor.forceFlush()
-        records = try await store.fetchAllRecords()
-        if records.count >= expectedRecordCount {
-            return records
-        }
-        try await Task.sleep(for: .milliseconds(20))
-    }
-    return records
-}
-
 // MARK: - Raw column reads
 
 /// Reads the raw text of one column for every row matching the given query, in query order.

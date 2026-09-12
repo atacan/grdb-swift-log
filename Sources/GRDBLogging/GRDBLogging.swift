@@ -3,6 +3,18 @@ import SwiftLogExport
 
 /// The namespace for installing SQLite-backed logging into swift-log.
 public enum GRDBLogging {
+    /// Installs the SQLite logging backend and starts its batching processor.
+    ///
+    /// Use this convenience entry point for Apple GUI applications whose lifecycle callbacks are synchronous. Keep
+    /// the returned runtime alive for explicit flush and terminal shutdown operations.
+    ///
+    /// - Warning: Like ``bootstrap(_:)``, this may only be called once per process.
+    /// - Parameter configuration: Where and how to log.
+    /// - Returns: A running logging runtime.
+    public static func start(_ configuration: GRDBLoggingConfiguration) -> GRDBLoggingRuntime {
+        GRDBLoggingRuntime(processor: bootstrap(configuration))
+    }
+
     /// Installs a SQLite logging backend into swift-log and returns the processor that drives it.
     ///
     /// The backend routes every log call through a `BatchLogRecordProcessor` into a ``GRDBLogRecordExporter``
